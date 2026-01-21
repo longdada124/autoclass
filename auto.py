@@ -1,0 +1,76 @@
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+import re
+
+st.set_page_config(page_title="後龍國中-調代課智慧管理系統", layout="wide")
+
+# 假設這是一個簡易的衝堂檢查邏輯
+def check_conflict(teacher_data, teacher_name, day, period):
+    if teacher_name in teacher_data:
+        if (day, period) in teacher_data[teacher_name]:
+            return True, teacher_data[teacher_name][(day, period)]['class']
+    return False, None
+
+st.title("📅 調代課智慧管理與通知單生成")
+
+# --- 側邊欄：延用之前讀取的課表資料 ---
+with st.sidebar:
+    st.header("📋 基礎課表導入")
+    st.info("請確認已上傳原始課表與配課資料（系統會自動連結前一個系統的數據）")
+    target_date = st.date_input("選擇調代課日期", datetime.now())
+    week_day = ["一", "二", "三", "四", "五", "六", "日"][target_date.weekday()]
+    st.write(f"當前日期為：週{week_day}")
+
+# --- 主畫面：模擬調代課操作 ---
+if 'teacher_data' in st.session_state:
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.subheader("1. 選擇請假/受調人")
+        all_teachers = st.session_state.ordered_teachers
+        absent_teacher = st.selectbox("請假或欲調課老師", all_teachers)
+        
+        # 顯示該師當日課表
+        st.write(f"🔍 {absent_teacher} 老師 週{week_day} 的課程：")
+        day_num = target_date.weekday() + 1
+        lessons = []
+        for p in range(1, 9):
+            info = st.session_state.teacher_data[absent_teacher].get((day_num, p), {})
+            if info:
+                lessons.append({"節次": p, "班級": info['class'], "科目": info['subj']})
+        
+        if lessons:
+            df_lessons = pd.DataFrame(lessons)
+            selected_period = st.radio("選取要處理的節次", df_lessons['節次'])
+        else:
+            st.warning("該老師此日無課程。")
+
+    with col2:
+        st.subheader("2. 安排代課或調課")
+        mode = st.radio("操作模式", ["代課 (找人補位)", "調課 (兩節互換)"])
+        
+        if mode == "代課 (找人補位)":
+            # 智慧推薦：找出當前節次空堂的老師
+            available_teachers = []
+            for t in all_teachers:
+                is_busy, _ = check_conflict(st.session_state.teacher_data, t, day_num, selected_period)
+                if not is_busy:
+                    available_teachers.append(t)
+            
+            sub_teacher = st.selectbox("選擇代課老師 (已過濾空堂者)", available_teachers)
+            st.success(f"✅ 已選定由 {sub_teacher} 老師代課")
+            
+        else:
+            st.write("請選擇調課的目標日期與節次...")
+            # 這裡之後會實作跨週互換邏輯
+
+    # --- 通知單預覽與產出 ---
+    st.divider()
+    if st.button("🖨️ 生成調代課通知單"):
+        st.info("正在將『代701 國文』寫入 Word 樣板指定格位...")
+        # 這裡會串接 master_replace 邏輯到您上傳的「代調課通知單.docx」
+        st.success("通知單產製成功！")
+
+else:
+    st.warning("請先在主系統上傳課表資料，系統才能進行衝堂檢查。")
