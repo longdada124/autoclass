@@ -1,99 +1,117 @@
 import streamlit as st
 import pandas as pd
-from docx import Document
-from io import BytesIO
-import re
 import requests
+import base64
+from io import BytesIO
+from docx import Document
+import re
 
-st.set_page_config(page_title="後龍國中課表彙整系統", layout="wide")
+# --- 1. 設定與 GitHub 連接 ---
+REPO = "longdada124/autoclass"
+TOKEN = st.secrets["G_TOKEN"]  # 請確保已在 Streamlit Secrets 設定此變數
+FILES = {
+    "assign": "配課表.xlsx",
+    "timetable": "課表.xlsx"
+}
 
-# --- 1. 從 GitHub 抓取檔案的函數 ---
-RAW_URL = "https://raw.githubusercontent.com/longdada124/autoclass/main/"
+def push_to_github(content, filename):
+    url = f"https://api.github.com/repos/{REPO}/contents/{filename}"
+    headers = {"Authorization": f"token {TOKEN}"}
+    r = requests.get(url, headers=headers)
+    sha = r.json().get("sha") if r.status_code == 200 else None
+    encoded = base64.b64encode(content).decode("utf-8")
+    data = {"message": f"Web Update {filename}", "content": encoded, "branch": "main"}
+    if sha: data["sha"] = sha
+    res = requests.put(url, headers=headers, json=data)
+    return res.status_code in [200, 201]
 
+def pull_from_github(filename):
+    url = f"https://raw.githubusercontent.com/{REPO}/main/{filename}"
+    r = requests.get(url)
+    return r.content if r.status_code == 200 else None
+
+# --- 2. 頁面配置 ---
+st.set_page_config(page_title="後龍國中課表雲端系統", layout="wide")
+
+# --- 3. 側邊欄：僅在需要更新時使用 ---
+with st.sidebar:
+    st.header("⚙️ 雲端資料更新")
+    st.info("上傳後點擊同步，資料將永久儲存於 GitHub。")
+    up_a = st.file_uploader("1. 更新配課表 (Excel)", type="xlsx")
+    up_t = st.file_uploader("2. 更新全校課表 (Excel)", type="xlsx")
+    
+    if st.button("🚀 同步並儲存至雲端"):
+        with st.spinner("同步中..."):
+            if up_a: push_to_github(up_a.getvalue(), FILES["assign"])
+            if up_t: push_to_github(up_t.getvalue(), FILES["timetable"])
+        st.success("✅ 同步成功！下次開啟不需再上傳。")
+        st.rerun()
+
+# --- 4. 資料讀取與解析邏輯 ---
 @st.cache_data(ttl=600)
-def fetch_excel_from_github(filename):
-    try:
-        r = requests.get(RAW_URL + filename)
-        r.raise_for_status()
-        return r.content
-    except Exception as e:
-        st.error(f"無法讀取 {filename}: {e}")
+def load_system_data():
+    a_bytes = pull_from_github(FILES["assign"])
+    t_bytes = pull_from_github(FILES["timetable"])
+    
+    if not a_bytes or not t_bytes:
         return None
 
-# --- 2. 核心邏輯：讀取所有班級工作表 ---
-def load_all_data():
-    assign_data = fetch_excel_from_github("配課表.xlsx")
-    table_data = fetch_excel_from_github("課表.xlsx")
+    xls_a = pd.read_excel(BytesIO(a_bytes), sheet_name=None)
+    xls_t = pd.read_excel(BytesIO(t_bytes), sheet_name=None)
     
-    if not assign_data or not table_data:
-        return None
+    t_db, c_db = {}, {}
+    all_t, all_c = set(), sorted(list(xls_t.keys()))
+    day_map = {"週一":1, "週二":2, "週三":3, "週四":4, "週五":5}
 
-    # 讀取 Excel 中所有的工作表
-    # xls_a: 每個 key 是班級名稱，value 是該班級的配課 Dataframe
-    xls_a = pd.read_excel(BytesIO(assign_data), sheet_name=None)
-    xls_t = pd.read_excel(BytesIO(table_data), sheet_name=None)
-    
-    teacher_data = {}
-    class_data = {}
-    all_teachers = set()
-
-    # 處理各班課表
-    for class_name, df_t in xls_t.items():
-        if class_name not in xls_a: continue # 若配課表沒這班就跳過
+    for c_name in all_c:
+        if c_name not in xls_a: continue
+        df_a = xls_a[c_name].astype(str).apply(lambda x: x.str.strip())
+        df_t = xls_t[c_name].astype(str).apply(lambda x: x.str.strip())
+        c_db[c_name] = {}
         
-        df_a = xls_a[class_name].astype(str).apply(lambda x: x.str.strip())
-        df_t = df_t.astype(str).apply(lambda x: x.str.strip())
-        
-        day_map = {"週一":1, "週二":2, "週三":3, "週四":4, "週五":5}
-        class_data[class_name] = {}
-
         for _, row in df_t.iterrows():
-            d_str = row['星期']
-            p_val = row['節次']
-            subj = row['科目']
-            
+            d_str, p_val, subj = row['星期'], row['節次'], row['科目']
             if d_str in day_map and str(p_val).isdigit():
                 d, p = day_map[d_str], int(p_val)
-                
-                # 從該班配課頁面找出老師
+                # 對應配課老師
                 match = df_a[df_a['科目'] == subj]
-                t_name = match.iloc[0]['教師'] if not match.empty else "未定"
+                t_raw = match.iloc[0]['教師'] if not match.empty else "未定"
+                c_db[c_name][(d, p)] = f"{subj}\n({t_raw})"
                 
-                # 存入班級預覽資料
-                class_data[class_name][(d, p)] = f"{subj}\n({t_name})"
-                
-                # 分解教師（處理如 葉麗君/張素梅）
-                for t in [x.strip() for x in t_name.split('/')]:
+                # 建立教師索引
+                for t in [x.strip() for x in t_raw.split('/')]:
                     if t == "未定": continue
-                    all_teachers.add(t)
-                    if t not in teacher_data: teacher_data[t] = {}
-                    teacher_data[t][(d, p)] = {"subj": subj, "class": class_name}
+                    all_t.add(t)
+                    if t not in t_db: t_db[t] = {}
+                    t_db[t][(d, p)] = {"c": c_name, "s": subj}
                     
-    return teacher_data, class_data, sorted(list(all_teachers)), sorted(list(class_data.keys()))
+    return t_db, c_db, sorted(list(all_t)), all_c
 
-# --- 3. 執行加載 ---
-data = load_all_data()
+# --- 5. 主介面顯示 ---
+data_package = load_system_data()
 
-if data:
-    t_db, c_db, teachers, classes = data
-    
-    tab1, tab2 = st.tabs(["🏫 班級課表預覽", "👨‍🏫 教師課表預覽"])
-    
+if data_package:
+    t_db, c_db, teachers, classes = data_package
+    tab1, tab2 = st.tabs(["🏫 班級課表預覽 (一班一頁格式)", "👨‍🏫 教師個人課表"])
+
     with tab1:
-        sel_c = st.selectbox("選擇班級", classes)
-        df_c = pd.DataFrame(index=[f"第{i}節" for i in range(1, 9)], columns=["週一", "週二", "週三", "週四", "週五"])
+        sel_c = st.selectbox("請選擇班級", classes)
+        view_c = pd.DataFrame(index=[f"第{i}節" for i in range(1, 9)], columns=["週一", "週二", "週三", "週四", "週五"])
         for d in range(1, 6):
             for p in range(1, 9):
-                df_c.iloc[p-1, d-1] = c_db.get(sel_c, {}).get((d, p), "")
-        st.table(df_c)
-        
+                view_c.iloc[p-1, d-1] = c_db.get(sel_c, {}).get((d, p), "")
+        st.table(view_c)
+
     with tab2:
-        sel_t = st.selectbox("選擇教師", teachers)
-        df_t = pd.DataFrame(index=[f"第{i}節" for i in range(1, 9)], columns=["週一", "週二", "週三", "週四", "週五"])
+        sel_t = st.selectbox("請選擇教師", teachers)
+        view_t = pd.DataFrame(index=[f"第{i}節" for i in range(1, 9)], columns=["週一", "週二", "週三", "週四", "週五"])
         for d in range(1, 6):
             for p in range(1, 9):
-                v = t_db.get(sel_t, {}).get((d, p))
-                df_t.iloc[p-1, d-1] = f"{v['class']}\n{v['subj']}" if v else ""
-        st.table(df_t)
+                item = t_db.get(sel_t, {}).get((d, p))
+                view_t.iloc[p-1, d-1] = f"{item['c']}\n{item['s']}" if item else ""
+        st.table(view_t)
+        
+        # 額外功能：如果需要 Word 輸出可在這裡加入之前給您的 master_replace 邏輯
 else:
-    st.info("請確認 GitHub 上的 配課表.xlsx 與 課表.xlsx 是否已準備就緒。")
+    st.warning("👋 歡迎使用！偵測到雲端尚無資料，請先在左側上傳 Excel 檔案並點擊同步。")
+    st.image("https://img.icons8.com/clouds/200/database.png")
