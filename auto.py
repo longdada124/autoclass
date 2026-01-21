@@ -5,44 +5,54 @@ from io import BytesIO
 import re
 from datetime import datetime, timedelta
 
-# 設定網頁標題與寬度
-st.set_page_config(page_title="後龍國中課表暨調代課系統", layout="wide")
+# --- 1. 基礎設定 ---
+st.set_page_config(page_title="後龍國中全方位課務系統", layout="wide")
 
-# --- 核心工具函數 ---
+# --- 2. 核心工具函數 ---
 
 def master_replace(doc_obj, old_text, new_text):
     """
-    進階替換函數：支援換行符號 \n，並盡可能保留原有的字體格式。
+    強力替換函數：
+    1. 支援換行符號 \n
+    2. 保留 Word 樣板原本的字體 (標楷體)
+    3. 適用於段落與表格
     """
-    new_val = str(new_text) if new_text is not None else ""
-    
-    # 1. 替換段落文字 (主要用於標題名字、日期)
+    if new_text is None: new_text = ""
+    new_val = str(new_text)
+
+    # 內部函數：處理單個 run 的替換
+    def replace_run(run):
+        if old_text in run.text:
+            if "\n" in new_val:
+                # 處理換行：切割文字 -> 插入換行符 -> 插入第二段
+                parts = new_val.split("\n")
+                # 替換掉標籤，換成第一行文字
+                run.text = run.text.replace(old_text, parts[0])
+                # 依序加入後面的文字
+                for part in parts[1:]:
+                    run.add_break() 
+                    run.add_text(part)
+            else:
+                # 一般替換 (包含替換成空字串)
+                run.text = run.text.replace(old_text, new_val)
+
+    # 1. 掃描文件段落 (如抬頭、日期)
     for p in doc_obj.paragraphs:
         if old_text in p.text:
             for run in p.runs:
-                if old_text in run.text:
-                    run.text = run.text.replace(old_text, new_val)
+                replace_run(run)
 
-    # 2. 替換表格文字 (主要用於課表格子，支援換行)
+    # 2. 掃描所有表格 (如課表格子)
     for table in doc_obj.tables:
         for row in table.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     if old_text in p.text:
                         for run in p.runs:
-                            if old_text in run.text:
-                                if "\n" in new_val:
-                                    # 處理換行需求
-                                    parts = new_val.split("\n")
-                                    run.text = run.text.replace(old_text, parts[0])
-                                    for part in parts[1:]:
-                                        run.add_break() # 插入 Word 的換行符
-                                        run.add_text(part)
-                                else:
-                                    run.text = run.text.replace(old_text, new_val)
+                            replace_run(run)
 
 def get_week_dates(base_date):
-    """計算該週週一至週五的民國年日期"""
+    """取得該週週一至週五的民國日期字串 (格式: 115.02.09)"""
     start_of_week = base_date - timedelta(days=base_date.weekday())
     dates = []
     for i in range(5):
@@ -51,155 +61,251 @@ def get_week_dates(base_date):
         dates.append(f"{roc_year}.{d.month:02d}.{d.day:02d}")
     return dates
 
-def fill_sub_notice(template_bytes, teacher_name, changes, week_dates):
-    """產製代課通知單核心邏輯"""
+def generate_doc(template_bytes, teacher_name, target_data, week_dates):
+    """
+    產製通知單主程序
+    target_data: {'day': 1, 'period': 2, 'content': '代701\n國文'}
+    """
     doc = Document(BytesIO(template_bytes))
     
-    # 填寫抬頭老師名字與五天的日期標籤
+    # 1. 填寫基本資料
     master_replace(doc, "{{TEACHER}}", teacher_name)
     for i, d_str in enumerate(week_dates):
         master_replace(doc, f"{{{{D{i+1}}}}}", d_str)
     
-    # 準備填寫課表的資料 Map
+    # 2. 建立「要填寫」的標籤清單
+    # 格式: {{1_2}} -> "代701\n國文"
     fill_map = {}
-    for chg in changes:
-        tag = f"{{{{{chg['day']}_{chg['period']}}}}}"
-        fill_map[tag] = chg['text']
-
-    # 掃描並填寫 1_1 到 5_8 的所有格子
+    target_tag = f"{{{{{target_data['day']}_{target_data['period']}}}}}"
+    fill_map[target_tag] = target_data['content']
+    
+    # 3. 強力掃描：填入目標內容，並清空其餘所有格子
+    # 假設一天最多9節，週一到週五
     for d in range(1, 6):
-        for p in range(1, 9):
+        for p in range(1, 10): 
             tag = f"{{{{{d}_{p}}}}}"
             if tag in fill_map:
+                # 這是要填寫的格子
                 master_replace(doc, tag, fill_map[tag])
             else:
-                master_replace(doc, tag, "") # 沒課的格子標籤清空
+                # 這是沒用到的格子，確實替換為「空字串」
+                master_replace(doc, tag, "")
+                
     return doc
 
-# --- 側邊欄：資料上傳 ---
-
+# --- 3. 側邊欄：資料讀取 ---
 with st.sidebar:
-    st.header("⚙️ 系統資料管理")
-    if st.button("🧹 清空所有資料"):
+    st.header("📂 系統資料上傳")
+    if st.button("🗑️ 清除資料重來"):
         st.session_state.clear()
         st.rerun()
     
-    st.divider()
-    f_assign = st.file_uploader("1. 上傳配課表 (xlsx/csv)", type=["xlsx", "csv"])
-    f_time = st.file_uploader("2. 上傳課表 (xlsx/csv)", type=["xlsx", "csv"])
-    f_sort = st.file_uploader("3. 上傳教師排序表 (xlsx/csv)", type=["xlsx", "csv"])
+    st.info("請依序上傳三個檔案以啟動系統")
+    f_assign = st.file_uploader("1. 配課表 (xlsx/csv)", type=["xlsx", "csv"])
+    f_time = st.file_uploader("2. 課表 (xlsx/csv)", type=["xlsx", "csv"])
+    f_sort = st.file_uploader("3. 教師排序表 (xlsx/csv)", type=["xlsx", "csv"])
     
     if f_assign and f_time and st.button("🚀 執行資料整合"):
         try:
-            # 讀取 Excel/CSV
-            df_assign = pd.read_excel(f_assign) if f_assign.name.endswith('xlsx') else pd.read_csv(f_assign)
-            df_time = pd.read_excel(f_time) if f_time.name.endswith('xlsx') else pd.read_csv(f_time)
-            
-            # 載入內建樣板
-            try:
-                with open("班級樣板.docx", "rb") as f: st.session_state.class_template = f.read()
-                with open("教師樣板.docx", "rb") as f: st.session_state.teacher_template = f.read()
-                with open("代調課通知單.docx", "rb") as f: st.session_state.sub_template = f.read()
-            except:
-                st.warning("⚠️ 提醒：GitHub 內缺少部分 .docx 樣板檔案。")
+            with st.spinner("正在分析資料..."):
+                # 讀取檔案
+                df_assign = pd.read_excel(f_assign) if f_assign.name.endswith('xlsx') else pd.read_csv(f_assign)
+                df_time = pd.read_excel(f_time) if f_time.name.endswith('xlsx') else pd.read_csv(f_time)
+                
+                # 嘗試讀取內建 Word 樣板 (需預先上傳到 GitHub)
+                try:
+                    with open("代調課通知單.docx", "rb") as f: 
+                        st.session_state.sub_template = f.read()
+                except:
+                    st.warning("⚠️ 尚未找到【代調課通知單.docx】，請確認 GitHub 檔案是否存在。")
 
-            # 資料處理邏輯
-            assign_lookup = []
-            all_teachers = set()
-            for _, row in df_assign.iterrows():
-                c, s, t_raw = str(row['班級']).strip(), str(row['科目']).strip(), str(row['教師']).strip()
-                for t in [x.strip() for x in t_raw.split('/')]:
-                    if t and t != "nan":
+                # 解析配課表 (建立老師名單)
+                assign_lookup = []
+                all_teachers = set()
+                for _, row in df_assign.iterrows():
+                    c, s, t_raw = str(row['班級']).strip(), str(row['科目']).strip(), str(row['教師']).strip()
+                    t_list = [t.strip() for t in t_raw.split('/') if t.strip() and t != "nan"]
+                    for t in t_list:
                         assign_lookup.append({'c': c, 's': s, 't': t})
                         all_teachers.add(t)
 
-            # 課表解析
-            class_db, teacher_db = {}, {}
-            day_map = {"一":1,"二":2,"三":3,"四":4,"五":5,"週一":1,"週二":2,"週三":3,"週四":4,"週五":5}
-            for _, row in df_time.iterrows():
-                c, s, d_str = str(row['班級']).strip(), str(row['科目']).strip(), str(row['星期']).strip()
-                d = day_map.get(d_str, 0)
-                p_match = re.search(r'\d+', str(row['節次']))
-                if p_match and d > 0:
-                    p = int(p_match.group())
-                    ts = [x['t'] for x in assign_lookup if x['c'] == c and x['s'] == s]
-                    t_disp = "/".join(ts)
-                    # 班級視角
-                    if c not in class_db: class_db[c] = {}
-                    class_db[c][(d, p)] = {"s": s, "t": t_disp}
-                    # 教師視角
-                    for t in ts:
-                        if t not in teacher_db: teacher_db[t] = {}
-                        teacher_db[t][(d, p)] = {"s": s, "c": c}
+                # 解析課表 (建立查詢索引)
+                class_db = {}   # 班級視角
+                teacher_db = {} # 老師視角
+                day_map = {"一":1, "二":2, "三":3, "四":4, "五":5, "週一":1, "週二":2, "週三":3, "週四":4, "週五":5}
+                
+                for _, row in df_time.iterrows():
+                    c = str(row['班級']).strip()
+                    s = str(row['科目']).strip()
+                    d_str = str(row['星期']).strip()
+                    d = day_map.get(d_str, 0)
+                    
+                    # 抓取節次數字
+                    p_match = re.search(r'\d+', str(row['節次']))
+                    
+                    if p_match and d > 0:
+                        p = int(p_match.group())
+                        # 找出這堂課的老師
+                        matches = [x['t'] for x in assign_lookup if x['c'] == c and x['s'] == s]
+                        t_disp = "/".join(matches) if matches else "未知"
+                        
+                        # 存入班級資料
+                        if c not in class_db: class_db[c] = {}
+                        class_db[c][(d, p)] = {"s": s, "t": t_disp}
+                        
+                        # 存入教師資料
+                        for t in matches:
+                            if t not in teacher_db: teacher_db[t] = {}
+                            teacher_db[t][(d, p)] = {"c": c, "s": s}
 
-            st.session_state.update({
-                "class_data": class_db, "teacher_data": teacher_db,
-                "ordered_teachers": sorted(list(all_teachers)), "data_ready": True
-            })
-            st.success("✅ 整合成功！")
-            st.rerun()
+                # 處理教師排序
+                ordered_teachers = sorted(list(all_teachers))
+                if f_sort:
+                    try:
+                        df_s = pd.read_excel(f_sort) if f_sort.name.endswith('xlsx') else pd.read_csv(f_sort)
+                        s_list = [str(x).strip() for x in df_s.iloc[:,0].tolist()]
+                        # 排序邏輯: 在清單內的優先，不在的放後面
+                        ordered_teachers = [t for t in s_list if t in all_teachers] + [t for t in ordered_teachers if t not in s_list]
+                    except: pass
+
+                st.session_state.class_data = class_db
+                st.session_state.teacher_data = teacher_db
+                st.session_state.ordered_teachers = ordered_teachers
+                st.session_state.data_ready = True
+                
+                st.success(f"✅ 資料整合完畢！共 {len(all_teachers)} 位教師。")
+                st.rerun()
+
         except Exception as e:
-            st.error(f"解析失敗: {e}")
+            st.error(f"❌ 資料解析失敗: {e}")
 
-# --- 主畫面：功能分頁 ---
+# --- 4. 主介面邏輯 ---
 
 if st.session_state.get("data_ready"):
-    tab1, tab2, tab3 = st.tabs(["🏫 班級課表", "👩‍🏫 教師課表", "📅 調代課管理"])
-
+    tab1, tab2, tab3 = st.tabs(["🏫 班級課表", "👩‍🏫 教師課表", "🔄 調代課通知單"])
+    
+    # === 分頁 1: 班級課表 ===
     with tab1:
-        c_list = sorted(list(st.session_state.class_data.keys()))
-        sel_c = st.selectbox("選擇班級", c_list)
-        df_c = pd.DataFrame(index=range(1,9), columns=["週一","週二","週三","週四","週五"])
-        for (d, p), val in st.session_state.class_data[sel_c].items():
-            df_c.iloc[p-1, d-1] = f"{val['s']}\n{val['t']}"
-        st.table(df_c.fillna(""))
+        if st.session_state.class_data:
+            c_list = sorted(list(st.session_state.class_data.keys()))
+            sel_c = st.selectbox("請選擇班級", c_list)
+            
+            # 建立課表 Grid
+            data_grid = {d: [""] * 8 for d in ["週一", "週二", "週三", "週四", "週五"]}
+            for (d, p), info in st.session_state.class_data.get(sel_c, {}).items():
+                if 1 <= p <= 8:
+                    data_grid[list(data_grid.keys())[d-1]][p-1] = f"{info['s']}\n{info['t']}"
+            
+            df_display = pd.DataFrame(data_grid)
+            df_display.index = [f"第{i}節" for i in range(1, 9)]
+            st.table(df_display)
+        else:
+            st.info("尚無班級資料")
 
+    # === 分頁 2: 教師課表 ===
     with tab2:
-        t_list = st.session_state.ordered_teachers
-        sel_t = st.selectbox("選擇教師", t_list)
-        df_t = pd.DataFrame(index=range(1,9), columns=["週一","週二","週三","週四","週五"])
-        for (d, p), val in st.session_state.teacher_data.get(sel_t, {}).items():
-            df_t.iloc[p-1, d-1] = f"{val['c']}\n{val['s']}"
-        st.table(df_t.fillna(""))
-
-    with tab3:
-        st.header("🔄 產製調代課通知單")
-        c1, c2 = st.columns(2)
-        with c1:
-            date_val = st.date_input("代課日期", datetime.now())
-            w_idx = date_val.weekday() + 1
-            w_dates = get_week_dates(date_val)
-        with c2:
-            absent_t = st.selectbox("請假老師", st.session_state.ordered_teachers)
-
-        # 找出該老師當天的課
-        lessons = []
-        for (d, p), v in st.session_state.teacher_data.get(absent_t, {}).items():
-            if d == w_idx:
-                lessons.append({"p": p, "c": v['c'], "s": v['s'], "txt": f"第{p}節: {v['c']} {v['s']}"})
+        sel_t = st.selectbox("請選擇教師", st.session_state.ordered_teachers)
+        data_grid_t = {d: [""] * 8 for d in ["週一", "週二", "週三", "週四", "週五"]}
         
-        if lessons:
-            sel_l = st.radio("選擇要代課的節次", lessons, format_func=lambda x: x['txt'])
+        info_map = st.session_state.teacher_data.get(sel_t, {})
+        for (d, p), info in info_map.items():
+            if 1 <= p <= 8:
+                data_grid_t[list(data_grid_t.keys())[d-1]][p-1] = f"{info['c']}\n{info['s']}"
+        
+        df_display_t = pd.DataFrame(data_grid_t)
+        df_display_t.index = [f"第{i}節" for i in range(1, 9)]
+        st.table(df_display_t)
+
+    # === 分頁 3: 調代課通知單 (重點功能) ===
+    with tab3:
+        st.markdown("### 步驟 1: 選擇原課程 (請假/調動方)")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            target_date = st.date_input("選擇日期", datetime.now())
+            week_idx = target_date.weekday() + 1 # 1=Mon, 5=Fri
+            week_dates = get_week_dates(target_date)
+            st.caption(f"本週區間：{week_dates[0]} ~ {week_dates[4]}")
             
-            # 過濾空堂老師
-            avail_ts = [t for t in st.session_state.ordered_teachers if (w_idx, sel_l['p']) not in st.session_state.teacher_data.get(t, {})]
-            sub_t = st.selectbox("選擇代課老師 (已過濾空堂)", avail_ts)
+        with col2:
+            orig_teacher = st.selectbox("原任課教師", st.session_state.ordered_teachers, index=0)
+
+        # 搜尋該老師當日的課
+        lessons = []
+        t_schedule = st.session_state.teacher_data.get(orig_teacher, {})
+        for p in range(1, 10):
+            if (week_idx, p) in t_schedule:
+                info = t_schedule[(week_idx, p)]
+                lessons.append({
+                    "p": p, 
+                    "c": info['c'], 
+                    "s": info['s'], 
+                    "label": f"第 {p} 節 - {info['c']} {info['s']}"
+                })
+        
+        if not lessons:
+            st.warning(f"⚠️ {orig_teacher} 老師在 {target_date} 沒有課程。")
+        else:
+            # 選擇課程
+            selected_lesson = st.radio("請勾選要處理的課程：", lessons, format_func=lambda x: x['label'])
             
+            st.divider()
+            st.markdown("### 步驟 2: 設定變動方式與接收教師")
+            
+            c3, c4 = st.columns(2)
+            with c3:
+                # 新增功能：選擇是代課還是調課
+                change_type = st.radio("變動類型", ["代課 (Substitute)", "調課 (Swap)"], horizontal=True)
+                type_prefix = "代" if "代課" in change_type else "調"
+            
+            with c4:
+                # 智慧過濾：預設濾掉該節次已經有課的老師
+                st.write("選擇新任課教師 (已過濾衝堂)")
+                available_ts = []
+                for t in st.session_state.ordered_teachers:
+                    # 檢查該老師當天該節次是否有課
+                    if (week_idx, selected_lesson['p']) not in st.session_state.teacher_data.get(t, {}):
+                        available_ts.append(t)
+                
+                new_teacher = st.selectbox("新任課教師", available_ts)
+
+            st.divider()
+            
+            # 預覽輸出結果
+            preview_text = f"{type_prefix}{selected_lesson['c']}\n{selected_lesson['s']}"
+            st.info(f"📄 預覽格子內容：\n\n{preview_text}\n\n(將填入 {new_teacher} 的通知單週{week_idx}第{selected_lesson['p']}節)")
+
             if st.button("🖨️ 產生 Word 通知單"):
                 if "sub_template" not in st.session_state:
-                    st.error("找不到樣板檔，請確認 GitHub 有『代調課通知單.docx』")
+                    st.error("❌ 錯誤：找不到樣板檔，請確認已上傳【代調課通知單.docx】")
                 else:
-                    # 構建換行內容 
-                    change = {
-                        'day': w_idx, 'period': sel_l['p'],
-                        'text': f"代{sel_l['c']}\n{sel_l['s']}" 
+                    # 準備資料包
+                    data_packet = {
+                        'day': week_idx,
+                        'period': selected_lesson['p'],
+                        'content': preview_text
                     }
-                    out_doc = fill_sub_notice(st.session_state.sub_template, sub_t, [change], w_dates)
                     
+                    # 呼叫產製函數
+                    final_doc = generate_doc(
+                        st.session_state.sub_template,
+                        new_teacher,
+                        data_packet,
+                        week_dates
+                    )
+                    
+                    # 存檔並提供下載
                     buf = BytesIO()
-                    out_doc.save(buf)
-                    st.download_button(f"⬇️ 下載 {sub_t} 代課單", buf.getvalue(), f"{sub_t}_代課單.docx")
-        else:
-            st.warning("該位老師當天沒有課程。")
+                    final_doc.save(buf)
+                    file_name = f"{target_date.strftime('%m%d')}_{new_teacher}_通知單.docx"
+                    
+                    st.success("✅ 產製成功！")
+                    st.download_button(
+                        label=f"⬇️ 下載 {new_teacher} 的通知單",
+                        data=buf.getvalue(),
+                        file_name=file_name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+
 else:
-    st.info("👋 請在左側上傳 Excel 檔案並點擊「執行資料整合」。")
+    st.info("👋 歡迎使用！請查看左側側邊欄，依序上傳資料以開始使用。")
